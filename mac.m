@@ -1679,30 +1679,48 @@ mouseaction(int btn, uint state, int release)
 
 - (void)scrollWheel:(NSEvent *)event
 {
+	static CGFloat accumY = 0.0;
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	uint state = modflags([event modifierFlags]);
-	int btn;
 
-	if ([event scrollingDeltaY] > 0)
-		btn = BTN_SCROLLUP;
-	else if ([event scrollingDeltaY] < 0)
-		btn = BTN_SCROLLDOWN;
-	else
+	CGFloat dy = [event scrollingDeltaY];
+	if (dy == 0)
 		return;
 
-	if (IS_SET(MODE_MOUSE) && !(state & forcemousemod)) {
-		mousereport(evcol(p), evrow(p), btn, (int)NSEventTypeLeftMouseDown, state);
-		return;
+	int lines;
+	if ([event hasPreciseScrollingDeltas]) {
+		/* Trackpad: accumulate pixel deltas, fire per line height */
+		accumY += dy;
+		lines = (int)(accumY / win.ch);
+		if (lines == 0)
+			return;
+		accumY -= lines * win.ch;
+	} else {
+		/* Discrete mouse wheel: use delta directly */
+		lines = (int)dy;
+		if (lines == 0)
+			lines = (dy > 0) ? 1 : -1;
 	}
 
-	/* Check mouse shortcuts for scroll */
-	for (int i = 0; i < (int)LEN(mshortcuts); i++) {
-		MouseShortcut *ms = &mshortcuts[i];
-		if (ms->button == (uint)btn &&
-		    (match(ms->mod, state) ||
-		     match(ms->mod, state & ~forcemousemod))) {
-			ms->func(&(ms->arg));
-			return;
+	int btn = (lines > 0) ? BTN_SCROLLUP : BTN_SCROLLDOWN;
+	int count = abs(lines);
+
+	for (int n = 0; n < count; n++) {
+		if (IS_SET(MODE_MOUSE) && !(state & forcemousemod)) {
+			mousereport(evcol(p), evrow(p), btn,
+			    (int)NSEventTypeLeftMouseDown, state);
+			continue;
+		}
+
+		/* Check mouse shortcuts for scroll */
+		for (int i = 0; i < (int)LEN(mshortcuts); i++) {
+			MouseShortcut *ms = &mshortcuts[i];
+			if (ms->button == (uint)btn &&
+			    (match(ms->mod, state) ||
+			     match(ms->mod, state & ~forcemousemod))) {
+				ms->func(&(ms->arg));
+				break;
+			}
 		}
 	}
 }
@@ -1772,6 +1790,22 @@ mouseaction(int btn, uint state, int release)
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
 {
 	return YES;
+}
+
+- (void)newWindow:(id)sender
+{
+	@autoreleasepool {
+		NSString *exe = [[NSBundle mainBundle] executablePath];
+		[NSTask launchedTaskWithLaunchPath:exe arguments:@[]];
+	}
+}
+
+- (NSMenu *)applicationDockMenu:(NSApplication *)sender
+{
+	NSMenu *menu = [[NSMenu alloc] init];
+	[menu addItemWithTitle:@"New Window"
+	    action:@selector(newWindow:) keyEquivalent:@""];
+	return menu;
 }
 
 /* NSWindowDelegate */
@@ -1864,6 +1898,13 @@ macinit(int cols_init, int rows_init)
 		    action:@selector(terminate:)
 		    keyEquivalent:@"q"];
 		[appItem setSubmenu:appMenu];
+
+		NSMenuItem *shellItem = [[NSMenuItem alloc] init];
+		[menubar addItem:shellItem];
+		NSMenu *shellMenu = [[NSMenu alloc] initWithTitle:@"Shell"];
+		[shellMenu addItemWithTitle:@"New Window"
+		    action:@selector(newWindow:) keyEquivalent:@"n"];
+		[shellItem setSubmenu:shellMenu];
 
 		NSMenuItem *editItem = [[NSMenuItem alloc] init];
 		[menubar addItem:editItem];

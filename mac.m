@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <locale.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <libgen.h>
@@ -141,10 +142,53 @@ typedef struct {
 
 /* Forward declarations */
 @class MTAppDelegate;
+@class MTView;
+
+typedef struct MTTerminal {
+	TermContext *tc;
+
+	/* Window + view */
+	NSWindow *macwin;
+	MTView *mtview;
+
+	/* Drawing */
+	DC dc;
+	TermWindow win;
+	CGContextRef backbuf;
+	CGFloat backingscale;
+	GlyphFontSpec *specbuf;
+
+	/* Fonts */
+	Fontcache *frc;
+	int frclen, frccap;
+	char *usedfont;
+	double usedfontsize, defaultfontsize;
+
+	/* Selection (mac-side) */
+	MTSelection msel;
+
+	/* Input */
+	uint buttons;
+
+	/* TTY + scheduling */
+	int ttyfd;
+	dispatch_source_t ttysrc;
+	dispatch_source_t procsrc;
+	dispatch_source_t drawtimer;
+	int drawing;
+	struct timespec trigger;
+	struct timespec lastblink;
+
+	/* Static locals moved to per-window */
+	int mouse_ox, mouse_oy;
+	CGFloat scroll_accumY;
+} MTTerminal;
 
 @interface MTView : NSView <NSTextInputClient>
 {
 	NSMutableAttributedString *_markedText;
+	@public
+	MTTerminal *terminal;
 }
 @end
 
@@ -162,41 +206,41 @@ static void xresize(int, int);
 static char *kmap(uint16_t, uint);
 static int match(uint, uint);
 static void schedule_draw(void);
-static void macinit(int, int);
+static void macinit(void);
+static MTTerminal *mt_newwindow(void);
 static void usage(void);
 static uint modflags(NSEventModifierFlags);
 
-/* Globals */
-static DC dc;
-static TermWindow win;
-static MTSelection msel;
-static CGContextRef backbuf;
-static CGFloat backingscale = 1.0;
-static NSWindow *macwin;
-static MTView *mtview;
+/* Per-window context pointer */
+static MTTerminal *cur;
 
-static Fontcache *frc = NULL;
-static int frclen = 0;
-static int frccap = 0;
-static char *usedfont = NULL;
-static double usedfontsize = 0;
-static double defaultfontsize = 0;
-
-static GlyphFontSpec *specbuf = NULL;
+#define dc            (cur->dc)
+#define win           (cur->win)
+#define msel          (cur->msel)
+#define backbuf       (cur->backbuf)
+#define backingscale  (cur->backingscale)
+#define macwin        (cur->macwin)
+#define mtview        (cur->mtview)
+#define frc           (cur->frc)
+#define frclen        (cur->frclen)
+#define frccap        (cur->frccap)
+#define usedfont      (cur->usedfont)
+#define usedfontsize  (cur->usedfontsize)
+#define defaultfontsize (cur->defaultfontsize)
+#define specbuf       (cur->specbuf)
+#define buttons       (cur->buttons)
+#define ttyfd         (cur->ttyfd)
+#define ttysrc        (cur->ttysrc)
+#define drawtimer     (cur->drawtimer)
+#define drawing       (cur->drawing)
+#define trigger       (cur->trigger)
+#define lastblink     (cur->lastblink)
 
 static char **opt_cmd  = NULL;
 static char *opt_font  = NULL;
 static char *opt_io    = NULL;
 static char *opt_line  = NULL;
 static char *opt_title = NULL;
-
-static uint buttons; /* bit field of pressed buttons */
-static int ttyfd = -1;
-static dispatch_source_t ttysrc;
-static dispatch_source_t drawtimer;
-static int drawing = 0;
-static struct timespec trigger;
-static struct timespec lastblink = {0};
 
 /* ---------- clipboard / shortcuts ---------- */
 
@@ -413,9 +457,8 @@ void
 xloadcols(void)
 {
 	int i;
-	static int loaded;
 
-	if (loaded) {
+	if (dc.col != NULL) {
 		for (size_t j = 0; j < dc.collen; ++j)
 			if (dc.col[j])
 				CGColorRelease(dc.col[j]);
@@ -432,7 +475,6 @@ xloadcols(void)
 			else
 				die("could not allocate color %d\n", i);
 		}
-	loaded = 1;
 }
 
 int
@@ -470,9 +512,9 @@ xsetcolorname(int x, const char *name)
 /* ---------- CGColor helpers for drawing ---------- */
 
 static void
-cgsetcolor(CGContextRef ctx, CGColorRef c)
+cgsetcolor(CGContextRef cg, CGColorRef c)
 {
-	CGContextSetFillColorWithColor(ctx, c);
+	CGContextSetFillColorWithColor(cg, c);
 }
 
 static CGColorRef
@@ -1171,9 +1213,12 @@ schedule_draw(void)
 	/* Schedule (or reschedule) a persistent timer */
 	uint64_t ns = (uint64_t)(timeout * 1e6);
 	if (!drawtimer) {
+		MTTerminal *mt = cur;
 		drawtimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
 		    0, 0, dispatch_get_main_queue());
 		dispatch_source_set_event_handler(drawtimer, ^{
+			cur = mt;
+			term_setctx(mt->tc);
 			/* Idle the timer until next schedule_draw() */
 			dispatch_source_set_timer(drawtimer,
 			    DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
@@ -1218,11 +1263,20 @@ setup_blink_timer(void)
 	dispatch_source_set_event_handler(blinksrc, ^{
 		struct timespec now;
 		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (tattrset(ATTR_BLINK)) {
-			win.mode ^= MODE_BLINK;
-			tsetdirtattr(ATTR_BLINK);
-			lastblink = now;
-			draw();
+		for (NSWindow *w in [NSApp windows]) {
+			if (![w contentView] || ![w isKindOfClass:[NSWindow class]])
+				continue;
+			MTView *v = (MTView *)[w contentView];
+			if (![v isKindOfClass:[MTView class]] || !v->terminal)
+				continue;
+			cur = v->terminal;
+			term_setctx(cur->tc);
+			if (tattrset(ATTR_BLINK)) {
+				win.mode ^= MODE_BLINK;
+				tsetdirtattr(ATTR_BLINK);
+				lastblink = now;
+				draw();
+			}
 		}
 	});
 	dispatch_resume(blinksrc);
@@ -1268,11 +1322,10 @@ mousereport(int x, int y, int btn, int evt, uint state)
 {
 	int len, code;
 	char buf[40];
-	static int ox, oy;
 
 	if (evt == NSEventTypeMouseMoved || evt == NSEventTypeLeftMouseDragged ||
 	    evt == NSEventTypeRightMouseDragged || evt == NSEventTypeOtherMouseDragged) {
-		if (x == ox && y == oy)
+		if (x == cur->mouse_ox && y == cur->mouse_oy)
 			return;
 		if (!IS_SET(MODE_MOUSEMOTION) && !IS_SET(MODE_MOUSEMANY))
 			return;
@@ -1298,8 +1351,8 @@ mousereport(int x, int y, int btn, int evt, uint state)
 		code = 0;
 	}
 
-	ox = x;
-	oy = y;
+	cur->mouse_ox = x;
+	cur->mouse_oy = y;
 
 	if ((!IS_SET(MODE_MOUSESGR) && (evt == NSEventTypeLeftMouseUp ||
 	    evt == NSEventTypeRightMouseUp || evt == NSEventTypeOtherMouseUp)) || btn == 12)
@@ -1372,6 +1425,9 @@ mouseaction(int btn, uint state, int release)
 - (void)viewDidChangeBackingProperties
 {
 	[super viewDidChangeBackingProperties];
+	if (!terminal) return;
+	cur = terminal;
+	term_setctx(cur->tc);
 	CGFloat newscale = self.window.backingScaleFactor;
 	if (newscale != backingscale) {
 		backingscale = newscale;
@@ -1385,6 +1441,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)keyDown:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	if (IS_SET(MODE_KBDLOCK))
 		return;
 
@@ -1495,6 +1553,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)insertText:(id)string replacementRange:(NSRange)replacementRange
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSString *str = ([string isKindOfClass:[NSAttributedString class]])
 	    ? [string string] : string;
 	const char *s = [str UTF8String];
@@ -1555,6 +1615,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)mouseDown:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	int btn = BTN_LEFT;
 	uint state = modflags([event modifierFlags]);
@@ -1589,6 +1651,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)mouseUp:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	int btn = BTN_LEFT;
 	uint state = modflags([event modifierFlags]);
@@ -1609,6 +1673,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)mouseDragged:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	uint state = modflags([event modifierFlags]);
 
@@ -1623,6 +1689,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)rightMouseDown:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	int btn = BTN_RIGHT;
 	uint state = modflags([event modifierFlags]);
@@ -1637,6 +1705,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)rightMouseUp:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	int btn = BTN_RIGHT;
 	uint state = modflags([event modifierFlags]);
@@ -1651,6 +1721,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)otherMouseDown:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	int btn = BTN_MIDDLE;
 	uint state = modflags([event modifierFlags]);
@@ -1665,6 +1737,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)otherMouseUp:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	int btn = BTN_MIDDLE;
 	uint state = modflags([event modifierFlags]);
@@ -1679,7 +1753,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)scrollWheel:(NSEvent *)event
 {
-	static CGFloat accumY = 0.0;
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	uint state = modflags([event modifierFlags]);
 
@@ -1690,11 +1765,11 @@ mouseaction(int btn, uint state, int release)
 	int lines;
 	if ([event hasPreciseScrollingDeltas]) {
 		/* Trackpad: accumulate pixel deltas, fire per line height */
-		accumY += dy;
-		lines = (int)(accumY / win.ch);
+		cur->scroll_accumY += dy;
+		lines = (int)(cur->scroll_accumY / win.ch);
 		if (lines == 0)
 			return;
-		accumY -= lines * win.ch;
+		cur->scroll_accumY -= lines * win.ch;
 	} else {
 		/* Discrete mouse wheel: use delta directly */
 		lines = (int)dy;
@@ -1727,6 +1802,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)otherMouseDragged:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	uint state = modflags([event modifierFlags]);
 	if (IS_SET(MODE_MOUSE) && !(state & forcemousemod)) {
@@ -1736,6 +1813,8 @@ mouseaction(int btn, uint state, int release)
 
 - (void)rightMouseDragged:(NSEvent *)event
 {
+	cur = terminal;
+	term_setctx(cur->tc);
 	NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 	uint state = modflags([event modifierFlags]);
 	if (IS_SET(MODE_MOUSE) && !(state & forcemousemod)) {
@@ -1750,6 +1829,8 @@ mouseaction(int btn, uint state, int release)
 @interface MTAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @end
 
+static MTAppDelegate *shared_delegate;
+
 @implementation MTAppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
@@ -1759,32 +1840,8 @@ mouseaction(int btn, uint state, int release)
 	if (home)
 		chdir(home);
 
-	/* TTY is set up after window is visible */
-	ttyfd = ttynew(opt_line, shell, opt_io, opt_cmd);
-	cresize(win.w, win.h);
-
-	/* Monitor PTY fd for data */
-	ttysrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
-	    ttyfd, 0, dispatch_get_main_queue());
-	dispatch_source_set_event_handler(ttysrc, ^{
-		ttyread();
-		schedule_draw();
-	});
-	dispatch_source_set_cancel_handler(ttysrc, ^{
-		ttyhangup();
-		exit(0);
-	});
-	dispatch_resume(ttysrc);
-
+	mt_newwindow();
 	setup_blink_timer();
-
-	/* initial draw */
-	draw();
-}
-
-- (void)applicationWillTerminate:(NSNotification *)notification
-{
-	ttyhangup();
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
@@ -1794,10 +1851,7 @@ mouseaction(int btn, uint state, int release)
 
 - (void)newWindow:(id)sender
 {
-	@autoreleasepool {
-		NSString *exe = [[NSBundle mainBundle] executablePath];
-		[NSTask launchedTaskWithLaunchPath:exe arguments:@[]];
-	}
+	mt_newwindow();
 }
 
 - (NSMenu *)applicationDockMenu:(NSApplication *)sender
@@ -1811,17 +1865,27 @@ mouseaction(int btn, uint state, int release)
 /* NSWindowDelegate */
 - (void)windowDidResize:(NSNotification *)notification
 {
-	NSRect frame = [[macwin contentView] frame];
-	int w = (int)frame.size.width;
-	int h = (int)frame.size.height;
-	if (w == win.w && h == win.h)
+	NSWindow *w = [notification object];
+	MTView *v = (MTView *)[w contentView];
+	if (!v || !v->terminal) return;
+	cur = v->terminal;
+	term_setctx(cur->tc);
+	NSRect frame = [v frame];
+	int nw = (int)frame.size.width;
+	int nh = (int)frame.size.height;
+	if (nw == win.w && nh == win.h)
 		return;
-	cresize(w, h);
+	cresize(nw, nh);
 	schedule_draw();
 }
 
 - (void)windowDidBecomeKey:(NSNotification *)notification
 {
+	NSWindow *w = [notification object];
+	MTView *v = (MTView *)[w contentView];
+	if (!v || !v->terminal) return;
+	cur = v->terminal;
+	term_setctx(cur->tc);
 	win.mode |= MODE_FOCUSED;
 	if (IS_SET(MODE_FOCUS))
 		ttywrite("\033[I", 3, 0);
@@ -1830,6 +1894,11 @@ mouseaction(int btn, uint state, int release)
 
 - (void)windowDidResignKey:(NSNotification *)notification
 {
+	NSWindow *w = [notification object];
+	MTView *v = (MTView *)[w contentView];
+	if (!v || !v->terminal) return;
+	cur = v->terminal;
+	term_setctx(cur->tc);
 	win.mode &= ~MODE_FOCUSED;
 	if (IS_SET(MODE_FOCUS))
 		ttywrite("\033[O", 3, 0);
@@ -1838,28 +1907,64 @@ mouseaction(int btn, uint state, int release)
 
 - (void)windowWillClose:(NSNotification *)notification
 {
+	NSWindow *w = [notification object];
+	MTView *v = (MTView *)[w contentView];
+	if (!v || !v->terminal) return;
+	MTTerminal *mt = v->terminal;
+	cur = mt;
+	term_setctx(mt->tc);
 	ttyhangup();
+	if (ttysrc) dispatch_source_cancel(ttysrc);
+	if (mt->procsrc) dispatch_source_cancel(mt->procsrc);
+	if (drawtimer) dispatch_source_cancel(drawtimer);
+	/* Free mac-side resources */
+	if (backbuf) CGContextRelease(backbuf);
+	free(specbuf);
+	/* Free font cache */
+	xunloadfonts();
+	free(frc);
+	/* Free colors */
+	if (dc.col) {
+		for (size_t j = 0; j < dc.collen; ++j)
+			if (dc.col[j])
+				CGColorRelease(dc.col[j]);
+		free(dc.col);
+	}
+	/* Free selection strings */
+	free(msel.primary);
+	free(msel.clipboard);
+	term_free(mt->tc);
+	v->terminal = NULL;
+	free(mt);
 }
 
 @end
 
-/* ---------- macinit ---------- */
+/* ---------- mt_newwindow ---------- */
 
-void
-macinit(int cols_init, int rows_init)
+static MTTerminal *
+mt_newwindow(void)
 {
 	@autoreleasepool {
-		[NSApplication sharedApplication];
-		[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+		MTTerminal *mt = xmalloc(sizeof(MTTerminal));
+		memset(mt, 0, sizeof(MTTerminal));
+		cur = mt;
+		ttyfd = -1;
 
-		/* font + colors */
+		/* Fonts + colors (per-window for independent zoom) */
 		usedfont = (opt_font == NULL) ? font : opt_font;
 		xloadfonts(usedfont, 0);
 		xloadcols();
 
-		win.w = 2 * borderpx + cols_init * win.cw;
-		win.h = 2 * borderpx + rows_init * win.ch;
+		/* Terminal */
+		mt->tc = term_new(cols, rows);
+		term_setctx(mt->tc);
 
+		/* Window dimensions */
+		win.w = 2 * borderpx + cols * win.cw;
+		win.h = 2 * borderpx + rows * win.ch;
+
+		/* NSWindow + MTView */
 		NSRect frame = NSMakeRect(100, 100, win.w, win.h);
 		macwin = [[NSWindow alloc] initWithContentRect:frame
 		    styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -1875,19 +1980,70 @@ macinit(int cols_init, int rows_init)
 
 		mtview = [[MTView alloc] initWithFrame:
 		    NSMakeRect(0, 0, win.w, win.h)];
+		mtview->terminal = mt;
 		mtview.layer.contentsScale = backingscale;
 		[macwin setContentView:mtview];
 		[macwin makeFirstResponder:mtview];
+		[macwin setDelegate:shared_delegate];
 
-		MTAppDelegate *delegate = [[MTAppDelegate alloc] init];
-		[NSApp setDelegate:delegate];
-		[macwin setDelegate:delegate];
-
+		/* Back buffer + spec buffer */
 		recreatebackbuf();
-		specbuf = xmalloc(cols_init * sizeof(GlyphFontSpec));
+		specbuf = xmalloc(cols * sizeof(GlyphFontSpec));
 
-		win.mode = MODE_NUMLOCK;
-		win.mode |= MODE_VISIBLE | MODE_FOCUSED;
+		win.mode = MODE_NUMLOCK | MODE_VISIBLE | MODE_FOCUSED;
+		xsetcursor(cursorshape);
+
+		/* Selection init */
+		clock_gettime(CLOCK_MONOTONIC, &msel.tclick1);
+		clock_gettime(CLOCK_MONOTONIC, &msel.tclick2);
+
+		/* TTY */
+		ttyfd = ttynew(opt_line, shell, opt_io, opt_cmd);
+		cresize(win.w, win.h);
+
+		/* Dispatch source for PTY reads */
+		ttysrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
+		    ttyfd, 0, dispatch_get_main_queue());
+		dispatch_source_set_event_handler(ttysrc, ^{
+			cur = mt;
+			term_setctx(mt->tc);
+			size_t ret = ttyread();
+			if (ret == (size_t)-1) {
+				[macwin close];
+				return;
+			}
+			schedule_draw();
+		});
+		dispatch_resume(ttysrc);
+
+		/* Dispatch source for child exit (reap zombie) */
+		mt->procsrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC,
+		    term_pid(mt->tc), DISPATCH_PROC_EXIT, dispatch_get_main_queue());
+		dispatch_source_set_event_handler(mt->procsrc, ^{
+			int stat;
+			waitpid(term_pid(mt->tc), &stat, WNOHANG);
+		});
+		dispatch_resume(mt->procsrc);
+
+		/* Show window and draw */
+		[macwin makeKeyAndOrderFront:nil];
+		draw();
+
+		return mt;
+	}
+}
+
+/* ---------- macinit ---------- */
+
+void
+macinit(void)
+{
+	@autoreleasepool {
+		[NSApplication sharedApplication];
+		[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+		shared_delegate = [[MTAppDelegate alloc] init];
+		[NSApp setDelegate:shared_delegate];
 
 		/* App menu */
 		NSMenu *menubar = [[NSMenu alloc] init];
@@ -1917,13 +2073,7 @@ macinit(int cols_init, int rows_init)
 
 		[NSApp setMainMenu:menubar];
 
-		[macwin makeKeyAndOrderFront:nil];
 		[NSApp activateIgnoringOtherApps:YES];
-
-		clock_gettime(CLOCK_MONOTONIC, &msel.tclick1);
-		clock_gettime(CLOCK_MONOTONIC, &msel.tclick2);
-		msel.primary = NULL;
-		msel.clipboard = NULL;
 	}
 }
 
@@ -1943,8 +2093,6 @@ usage(void)
 int
 main(int argc, char *argv[])
 {
-	xsetcursor(cursorshape);
-
 	ARGBEGIN {
 	case 'a':
 		allowaltscreen = 0;
@@ -1997,9 +2145,7 @@ run:
 	setlocale(LC_CTYPE, "");
 	cols = MAX(cols, 1);
 	rows = MAX(rows, 1);
-	tnew(cols, rows);
-	selinit();
-	macinit(cols, rows);
+	macinit();
 
 	/* Run the Cocoa event loop */
 	[NSApp run];

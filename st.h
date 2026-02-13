@@ -105,6 +105,13 @@ void selextend(int, int, int, int);
 int selected(int, int);
 char *getsel(void);
 
+/* Multi-window support */
+typedef struct TermContext TermContext;
+TermContext *term_new(int cols, int rows);
+void         term_setctx(TermContext *);
+void         term_free(TermContext *);
+pid_t        term_pid(TermContext *);
+
 size_t utf8encode(Rune, char *);
 
 void *xmalloc(size_t);

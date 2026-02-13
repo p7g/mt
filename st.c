@@ -154,7 +154,6 @@ typedef struct {
 
 static void execsh(char *, char **);
 static void stty(char **);
-static void sigchld(int);
 static void ttywriteraw(const char *, size_t);
 
 static void csidump(void);
@@ -218,14 +217,28 @@ static char base64dec_getc(const char **);
 
 static ssize_t xwrite(int, const char *, size_t);
 
-/* Globals */
-static Term term;
-static Selection sel;
-static CSIEscape csiescseq;
-static STREscape strescseq;
-static int iofd = 1;
-static int cmdfd;
-static pid_t pid;
+/* Per-terminal context */
+typedef struct TermContext {
+	Term term;
+	Selection sel;
+	CSIEscape csiescseq;
+	STREscape strescseq;
+	int cmdfd;
+	pid_t pid;
+	int iofd;
+	/* ttyread() buffer state */
+	char ttybuf[BUFSIZ];
+	int ttybuflen;
+	/* tcursor() saved cursors */
+	TCursor saved_cursors[2];
+} TermContext;
+
+static TermContext *ctx;
+
+#define term      (ctx->term)
+#define sel       (ctx->sel)
+#define csiescseq (ctx->csiescseq)
+#define strescseq (ctx->strescseq)
 
 static const uchar utfbyte[UTF_SIZ + 1] = {0x80,    0, 0xC0, 0xE0, 0xF0};
 static const uchar utfmask[UTF_SIZ + 1] = {0xC0, 0x80, 0xE0, 0xF0, 0xF8};
@@ -710,25 +723,6 @@ execsh(char *cmd, char **args)
 }
 
 void
-sigchld(int a)
-{
-	int stat;
-	pid_t p;
-
-	if ((p = waitpid(pid, &stat, WNOHANG)) < 0)
-		die("waiting for pid %hd failed: %s\n", pid, strerror(errno));
-
-	if (pid != p)
-		return;
-
-	if (WIFEXITED(stat) && WEXITSTATUS(stat))
-		die("child exited with status %d\n", WEXITSTATUS(stat));
-	else if (WIFSIGNALED(stat))
-		die("child terminated due to signal %d\n", WTERMSIG(stat));
-	_exit(0);
-}
-
-void
 stty(char **args)
 {
 	char cmd[_POSIX_ARG_MAX], **p, *q, *s;
@@ -759,33 +753,33 @@ ttynew(const char *line, char *cmd, const char *out, char **args)
 
 	if (out) {
 		term.mode |= MODE_PRINT;
-		iofd = (!strcmp(out, "-")) ?
+		ctx->iofd = (!strcmp(out, "-")) ?
 			  1 : open(out, O_WRONLY | O_CREAT, 0666);
-		if (iofd < 0) {
+		if (ctx->iofd < 0) {
 			fprintf(stderr, "Error opening %s:%s\n",
 				out, strerror(errno));
 		}
 	}
 
 	if (line) {
-		if ((cmdfd = open(line, O_RDWR)) < 0)
+		if ((ctx->cmdfd = open(line, O_RDWR)) < 0)
 			die("open line '%s' failed: %s\n",
 			    line, strerror(errno));
-		dup2(cmdfd, 0);
+		dup2(ctx->cmdfd, 0);
 		stty(args);
-		return cmdfd;
+		return ctx->cmdfd;
 	}
 
 	/* seems to work fine on linux, openbsd and freebsd */
 	if (openpty(&m, &s, NULL, NULL, NULL) < 0)
 		die("openpty failed: %s\n", strerror(errno));
 
-	switch (pid = fork()) {
+	switch (ctx->pid = fork()) {
 	case -1:
 		die("fork failed: %s\n", strerror(errno));
 		break;
 	case 0:
-		close(iofd);
+		close(ctx->iofd);
 		close(m);
 		setsid(); /* create a new process group */
 		dup2(s, 0);
@@ -807,35 +801,34 @@ ttynew(const char *line, char *cmd, const char *out, char **args)
 			die("pledge\n");
 #endif
 		close(s);
-		cmdfd = m;
-		signal(SIGCHLD, sigchld);
+		ctx->cmdfd = m;
 		break;
 	}
-	return cmdfd;
+	return ctx->cmdfd;
 }
 
 size_t
 ttyread(void)
 {
-	static char buf[BUFSIZ];
-	static int buflen = 0;
+	char *buf = ctx->ttybuf;
+	int *buflen = &ctx->ttybuflen;
 	int ret, written;
 
 	/* append read bytes to unprocessed bytes */
-	ret = read(cmdfd, buf+buflen, LEN(buf)-buflen);
+	ret = read(ctx->cmdfd, buf+*buflen, BUFSIZ-*buflen);
 
 	switch (ret) {
 	case 0:
-		exit(0);
+		return (size_t)-1;
 	case -1:
 		die("couldn't read from shell: %s\n", strerror(errno));
 	default:
-		buflen += ret;
-		written = twrite(buf, buflen, 0);
-		buflen -= written;
+		*buflen += ret;
+		written = twrite(buf, *buflen, 0);
+		*buflen -= written;
 		/* keep any incomplete UTF-8 byte sequence for the next call */
-		if (buflen > 0)
-			memmove(buf, buf + written, buflen);
+		if (*buflen > 0)
+			memmove(buf, buf + written, *buflen);
 		return ret;
 	}
 }
@@ -884,22 +877,22 @@ ttywriteraw(const char *s, size_t n)
 	while (n > 0) {
 		FD_ZERO(&wfd);
 		FD_ZERO(&rfd);
-		FD_SET(cmdfd, &wfd);
-		FD_SET(cmdfd, &rfd);
+		FD_SET(ctx->cmdfd, &wfd);
+		FD_SET(ctx->cmdfd, &rfd);
 
 		/* Check if we can write. */
-		if (pselect(cmdfd+1, &rfd, &wfd, NULL, NULL, NULL) < 0) {
+		if (pselect(ctx->cmdfd+1, &rfd, &wfd, NULL, NULL, NULL) < 0) {
 			if (errno == EINTR)
 				continue;
 			die("select failed: %s\n", strerror(errno));
 		}
-		if (FD_ISSET(cmdfd, &wfd)) {
+		if (FD_ISSET(ctx->cmdfd, &wfd)) {
 			/*
 			 * Only write the bytes written by ttywrite() or the
 			 * default of 256. This seems to be a reasonable value
 			 * for a serial line. Bigger values might clog the I/O.
 			 */
-			if ((r = write(cmdfd, s, (n < lim)? n : lim)) < 0)
+			if ((r = write(ctx->cmdfd, s, (n < lim)? n : lim)) < 0)
 				goto write_error;
 			if (r < n) {
 				/*
@@ -916,7 +909,7 @@ ttywriteraw(const char *s, size_t n)
 				break;
 			}
 		}
-		if (FD_ISSET(cmdfd, &rfd))
+		if (FD_ISSET(ctx->cmdfd, &rfd))
 			lim = ttyread();
 	}
 	return;
@@ -934,7 +927,7 @@ ttyresize(int tw, int th)
 	w.ws_col = term.col;
 	w.ws_xpixel = tw;
 	w.ws_ypixel = th;
-	if (ioctl(cmdfd, TIOCSWINSZ, &w) < 0)
+	if (ioctl(ctx->cmdfd, TIOCSWINSZ, &w) < 0)
 		fprintf(stderr, "Couldn't set window size: %s\n", strerror(errno));
 }
 
@@ -942,7 +935,7 @@ void
 ttyhangup(void)
 {
 	/* Send SIGHUP to shell */
-	kill(pid, SIGHUP);
+	kill(ctx->pid, SIGHUP);
 }
 
 int
@@ -999,7 +992,7 @@ tfulldirt(void)
 void
 tcursor(int mode)
 {
-	static TCursor c[2];
+	TCursor *c = ctx->saved_cursors;
 	int alt = IS_SET(MODE_ALTSCREEN);
 
 	if (mode == CURSOR_SAVE) {
@@ -2059,17 +2052,17 @@ strreset(void)
 void
 sendbreak(const Arg *arg)
 {
-	if (tcsendbreak(cmdfd, 0))
+	if (tcsendbreak(ctx->cmdfd, 0))
 		perror("Error sending break");
 }
 
 void
 tprinter(char *s, size_t len)
 {
-	if (iofd != -1 && xwrite(iofd, s, len) < 0) {
+	if (ctx->iofd != -1 && xwrite(ctx->iofd, s, len) < 0) {
 		perror("Error writing to output file");
-		close(iofd);
-		iofd = -1;
+		close(ctx->iofd);
+		ctx->iofd = -1;
 	}
 }
 
@@ -2702,4 +2695,51 @@ redraw(void)
 {
 	tfulldirt();
 	draw();
+}
+
+/* Multi-window API */
+
+TermContext *
+term_new(int col, int row)
+{
+	TermContext *tc = xmalloc(sizeof(TermContext));
+	memset(tc, 0, sizeof(TermContext));
+	tc->iofd = 1;
+	ctx = tc;
+	tnew(col, row);
+	selinit();
+	return tc;
+}
+
+void
+term_setctx(TermContext *tc)
+{
+	ctx = tc;
+}
+
+void
+term_free(TermContext *tc)
+{
+	int i;
+	ctx = tc;
+	for (i = 0; i < term.row; i++) {
+		free(term.line[i]);
+		free(term.alt[i]);
+	}
+	free(term.line);
+	free(term.alt);
+	free(term.dirty);
+	free(term.tabs);
+	free(strescseq.buf);
+	if (tc->cmdfd > 0)
+		close(tc->cmdfd);
+	if (tc->iofd > 2)
+		close(tc->iofd);
+	free(tc);
+}
+
+pid_t
+term_pid(TermContext *tc)
+{
+	return tc->pid;
 }

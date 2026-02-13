@@ -1,30 +1,29 @@
-## Why does st not handle utmp entries?
+## Why does mt not handle utmp entries?
 
 Use the excellent tool of [utmp](https://git.suckless.org/utmp/) for this task.
 
 
 ## Some _random program_ complains that st is unknown/not recognised/unsupported/whatever!
 
-It means that st doesn’t have any terminfo entry on your system. Chances are
+It means that mt doesn't have any terminfo entry on your system. Chances are
 you did not `make install`. If you just want to test it without installing it,
 you can manually run `tic -sx st.info`.
 
 
 ## Nothing works, and nothing is said about an unknown terminal!
 
-* Some programs just assume they’re running in xterm i.e. they don’t rely on
-  terminfo. What you see is the current state of the “xterm compliance”.
-* Some programs don’t complain about the lacking st description and default to
+* Some programs just assume they're running in xterm i.e. they don't rely on
+  terminfo. What you see is the current state of the "xterm compliance".
+* Some programs don't complain about the lacking st description and default to
   another terminal. In that case see the question about terminfo.
 
 
 ## How do I scroll back up?
 
 * Using a terminal multiplexer.
-	* `st -e tmux` using C-b [
-	* `st -e screen` using C-a ESC
+	* `mt -e tmux` using C-b [
+	* `mt -e screen` using C-a ESC
 * Using the excellent tool of [scroll](https://git.suckless.org/scroll/).
-* Using the scrollback [patch](https://st.suckless.org/patches/scrollback/).
 
 
 ## I would like to have utmp and/or scroll functionality by default
@@ -45,7 +44,7 @@ Taken from the terminfo manpage:
 	codes as smkx and rmkx. Otherwise the keypad is assumed to
 	always transmit.
 
-In the st case smkx=E[?1hE= and rmkx=E[?1lE>, so it is mandatory that
+In the mt case smkx=E[?1hE= and rmkx=E[?1lE>, so it is mandatory that
 applications which want to test against keypad keys send these
 sequences.
 
@@ -89,25 +88,9 @@ If you are using zsh, then read the zsh FAQ
 Putting these lines into your .zshrc will fix the problems.
 
 
-## How can I use meta in 8bit mode?
-
-St supports meta in 8bit mode, but the default terminfo entry doesn't
-use this capability. If you want it, you have to use the 'st-meta' value
-in TERM.
-
-
-## I cannot compile st in OpenBSD
-
-OpenBSD lacks librt, despite it being mandatory in POSIX
-<http://pubs.opengroup.org/onlinepubs/9699919799/utilities/c99.html#tag_20_11_13>.
-If you want to compile st for OpenBSD you have to remove -lrt from config.mk, and
-st will compile without any loss of functionality, because all the functions are
-included in libc on this platform.
-
-
 ## The Backspace Case
 
-St is emulating the Linux way of handling backspace being delete and delete being
+Mt is emulating the Linux way of handling backspace being delete and delete being
 backspace.
 
 This is an issue that was discussed in suckless mailing list
@@ -156,7 +139,7 @@ terminal users wants its backspace to be how he feels it:
 	value of stty erase, so you always get the default value.
 	For this reason, it is necessary to add 'stty erase ^H' to your
 	profile if you have changed the value of the backspace key.
-	Of course, another solution is for st itself to modify the
+	Of course, another solution is for mt itself to modify the
 	value of stty erase.  I usually have the inverse problem:
 	when I connect to non-Unix machines, I have to press CONTROL +
 	h to get a BACKSPACE. The inverse problem occurs when a user
@@ -167,87 +150,13 @@ terminal users wants its backspace to be how he feels it:
 	[2] http://www.tldp.org/HOWTO/Keyboard-and-Console-HOWTO-5.html
 
 
-## But I really want the old grumpy behaviour of my terminal
+## How do I find available font names?
 
-Apply [1].
-
-[1] https://st.suckless.org/patches/delkey
-
-
-## Why do images not work in st using the w3m image hack?
-
-w3mimg uses a hack that draws an image on top of the terminal emulator Drawable
-window. The hack relies on the terminal to use a single buffer to draw its
-contents directly.
-
-st uses double-buffered drawing so the image is quickly replaced and may show a
-short flicker effect.
-
-Below is a patch example to change st double-buffering to a single Drawable
-buffer.
-
-diff --git a/x.c b/x.c
---- a/x.c
-+++ b/x.c
-@@ -732,10 +732,6 @@ xresize(int col, int row)
- 	win.tw = col * win.cw;
- 	win.th = row * win.ch;
- 
--	XFreePixmap(xw.dpy, xw.buf);
--	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
--			DefaultDepth(xw.dpy, xw.scr));
--	XftDrawChange(xw.draw, xw.buf);
- 	xclear(0, 0, win.w, win.h);
- 
- 	/* resize to new width */
-@@ -1148,8 +1144,7 @@ xinit(int cols, int rows)
- 	gcvalues.graphics_exposures = False;
- 	dc.gc = XCreateGC(xw.dpy, parent, GCGraphicsExposures,
- 			&gcvalues);
--	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
--			DefaultDepth(xw.dpy, xw.scr));
-+	xw.buf = xw.win;
- 	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
- 	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
- 
-@@ -1632,8 +1627,6 @@ xdrawline(Line line, int x1, int y1, int x2)
- void
- xfinishdraw(void)
- {
--	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, win.w,
--			win.h, 0, 0);
- 	XSetForeground(xw.dpy, dc.gc,
- 			dc.col[IS_SET(MODE_REVERSE)?
- 				defaultfg : defaultbg].pixel);
+Run `system_profiler SPFontsDataType` to list all installed fonts and their
+family names. Use the family name in config.h, e.g. `"Rec Mono Duotone:size=12"`.
 
 
-## BadLength X error in Xft when trying to render emoji
+## How do I launch mt from Spotlight?
 
-Xft makes st crash when rendering color emojis with the following error:
-
-"X Error of failed request:  BadLength (poly request too large or internal Xlib length error)"
-  Major opcode of failed request:  139 (RENDER)
-  Minor opcode of failed request:  20 (RenderAddGlyphs)
-  Serial number of failed request: 1595
-  Current serial number in output stream:  1818"
-
-This is a known bug in Xft (not st) which happens on some platforms and
-combination of particular fonts and fontconfig settings.
-
-See also:
-https://gitlab.freedesktop.org/xorg/lib/libxft/issues/6
-https://bugs.freedesktop.org/show_bug.cgi?id=107534
-https://bugzilla.redhat.com/show_bug.cgi?id=1498269
-
-The solution is to remove color emoji fonts or disable this in the fontconfig
-XML configuration.  As an ugly workaround (which may work only on newer
-fontconfig versions (FC_COLOR)), the following code can be used to mask color
-fonts:
-
-	FcPatternAddBool(fcpattern, FC_COLOR, FcFalse);
-
-Please don't bother reporting this bug to st, but notify the upstream Xft
-developers about fixing this bug.
-
-As of 2022-09-05 this now seems to be finally fixed in libXft 2.3.5:
-https://gitlab.freedesktop.org/xorg/lib/libxft/-/blob/libXft-2.3.5/NEWS
+Run `make install` to install mt.app to ~/Applications. It will then appear in
+Spotlight search.

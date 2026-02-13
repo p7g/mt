@@ -10,8 +10,6 @@ code & interface
 
 drawing
 -------
-* add diacritics support to xdraws()
-	* switch to a suckless font drawing library
 * make the font cache simpler
 * add better support for brightening of the upper colors
 

@@ -340,11 +340,11 @@ sixd_to_16bit(int x)
 static CGColorRef
 makecol(CGFloat r, CGFloat g, CGFloat b, CGFloat a)
 {
-	CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+	static CGColorSpaceRef cs;
+	if (!cs)
+		cs = CGColorSpaceCreateDeviceRGB();
 	CGFloat comps[4] = {r, g, b, a};
-	CGColorRef c = CGColorCreate(cs, comps);
-	CGColorSpaceRelease(cs);
-	return c;
+	return CGColorCreate(cs, comps);
 }
 
 static int
@@ -604,10 +604,11 @@ recreatebackbuf(void)
 
 	int pw = (int)(win.w * backingscale);
 	int ph = (int)(win.h * backingscale);
-	CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+	static CGColorSpaceRef cs;
+	if (!cs)
+		cs = CGColorSpaceCreateDeviceRGB();
 	backbuf = CGBitmapContextCreate(NULL, pw, ph, 8, pw * 4, cs,
 	    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
-	CGColorSpaceRelease(cs);
 
 	/* Flip coordinate system and scale for Retina */
 	CGContextTranslateCTM(backbuf, 0, ph);
@@ -815,7 +816,11 @@ xdrawglyphfontspecs(const GlyphFontSpec *specs, Glyph base, int len, int x, int 
 	const CGFloat *fgcomps = CGColorGetComponents(fg);
 	CGContextSetRGBFillColor(backbuf, fgcomps[0], fgcomps[1], fgcomps[2], 1.0);
 
-	/* Group glyphs by font for batch drawing */
+	/* Group glyphs by font for batch drawing.
+	 * Use stack buffers for typical runs; fall back to heap for huge ones. */
+	#define STACK_GLYPHS 512
+	CGGlyph  sglyphs[STACK_GLYPHS];
+	CGPoint  spositions[STACK_GLYPHS];
 	int start = 0;
 	while (start < len) {
 		CTFontRef curfont = specs[start].font;
@@ -824,34 +829,29 @@ xdrawglyphfontspecs(const GlyphFontSpec *specs, Glyph base, int len, int x, int 
 			end++;
 
 		int count = end - start;
-		CGGlyph *glyphs = xmalloc(count * sizeof(CGGlyph));
-		CGPoint *positions = xmalloc(count * sizeof(CGPoint));
+		CGGlyph *glyphs = (count <= STACK_GLYPHS) ? sglyphs
+		    : xmalloc(count * sizeof(CGGlyph));
+		CGPoint *positions = (count <= STACK_GLYPHS) ? spositions
+		    : xmalloc(count * sizeof(CGPoint));
 		for (int j = 0; j < count; j++) {
 			glyphs[j] = specs[start+j].glyph;
-			/* Flip y: convert from top-down to CG's bottom-up within our flipped context.
-			 * In our flipped context, y increases downward.
-			 * CTFontDrawGlyphs expects y as the baseline position where
-			 * in the *native* CG coordinate system (y-up within our flipped context block).
-			 * We use CGContextSaveGState/unflip to draw text. */
-			positions[j] = CGPointMake(specs[start+j].x, specs[start+j].y);
+			/* Compute flipped y directly: Core Text draws in
+			 * y-up coords, so negate y after the scale(-1) flip. */
+			positions[j] = CGPointMake(specs[start+j].x,
+			    -specs[start+j].y);
 		}
 
 		/* Draw text by temporarily unflipping for Core Text */
 		CGContextSaveGState(backbuf);
 		CGContextScaleCTM(backbuf, 1.0, -1.0);
-		/* After flipping, the y coordinates need to be negated */
-		CGPoint *flippedpos = xmalloc(count * sizeof(CGPoint));
-		for (int j = 0; j < count; j++) {
-			flippedpos[j] = CGPointMake(positions[j].x, -positions[j].y);
-		}
-		CTFontDrawGlyphs(curfont, glyphs, flippedpos, count, backbuf);
+		CTFontDrawGlyphs(curfont, glyphs, positions, count, backbuf);
 		CGContextRestoreGState(backbuf);
 
-		free(glyphs);
-		free(positions);
-		free(flippedpos);
+		if (glyphs != sglyphs) free(glyphs);
+		if (positions != spositions) free(positions);
 		start = end;
 	}
+	#undef STACK_GLYPHS
 
 	/* Render underline */
 	if (base.mode & ATTR_UNDERLINE) {
@@ -1059,10 +1059,7 @@ xsettitle(char *p)
 		DEFAULT(p, opt_title);
 		if (p[0] == '\0')
 			p = opt_title;
-		NSString *title = [NSString stringWithUTF8String:p];
-		dispatch_async(dispatch_get_main_queue(), ^{
-			[macwin setTitle:title];
-		});
+		[macwin setTitle:[NSString stringWithUTF8String:p]];
 	}
 }
 
@@ -1171,39 +1168,38 @@ schedule_draw(void)
 		return;
 	}
 
-	/* Schedule a timer to fire after timeout ms */
-	if (drawtimer) {
-		dispatch_source_cancel(drawtimer);
-		drawtimer = NULL;
-	}
-
-	drawtimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-	    dispatch_get_main_queue());
+	/* Schedule (or reschedule) a persistent timer */
 	uint64_t ns = (uint64_t)(timeout * 1e6);
-	dispatch_source_set_timer(drawtimer, dispatch_time(DISPATCH_TIME_NOW, ns),
-	    DISPATCH_TIME_FOREVER, ns / 10);
-	dispatch_source_set_event_handler(drawtimer, ^{
-		dispatch_source_cancel(drawtimer);
-		drawtimer = NULL;
+	if (!drawtimer) {
+		drawtimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
+		    0, 0, dispatch_get_main_queue());
+		dispatch_source_set_event_handler(drawtimer, ^{
+			/* Idle the timer until next schedule_draw() */
+			dispatch_source_set_timer(drawtimer,
+			    DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
 
-		struct timespec now2;
-		clock_gettime(CLOCK_MONOTONIC, &now2);
+			struct timespec now2;
+			clock_gettime(CLOCK_MONOTONIC, &now2);
 
-		if (blinktimeout && tattrset(ATTR_BLINK)) {
-			double bt = blinktimeout - TIMEDIFF(now2, lastblink);
-			if (bt <= 0) {
-				if (-bt > blinktimeout)
-					win.mode |= MODE_BLINK;
-				win.mode ^= MODE_BLINK;
-				tsetdirtattr(ATTR_BLINK);
-				lastblink = now2;
+			if (blinktimeout && tattrset(ATTR_BLINK)) {
+				double bt = blinktimeout - TIMEDIFF(now2, lastblink);
+				if (bt <= 0) {
+					if (-bt > blinktimeout)
+						win.mode |= MODE_BLINK;
+					win.mode ^= MODE_BLINK;
+					tsetdirtattr(ATTR_BLINK);
+					lastblink = now2;
+				}
 			}
-		}
 
-		draw();
-		drawing = 0;
-	});
-	dispatch_resume(drawtimer);
+			draw();
+			drawing = 0;
+		});
+		dispatch_resume(drawtimer);
+	}
+	dispatch_source_set_timer(drawtimer,
+	    dispatch_time(DISPATCH_TIME_NOW, ns),
+	    DISPATCH_TIME_FOREVER, ns / 10);
 }
 
 /* ---------- blink timer ---------- */

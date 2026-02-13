@@ -1740,6 +1740,11 @@ mouseaction(int btn, uint state, int release)
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
 {
+	/* When launched from Finder/Spotlight, cwd is / — fix it */
+	const char *home = getenv("HOME");
+	if (home)
+		chdir(home);
+
 	/* TTY is set up after window is visible */
 	ttyfd = ttynew(opt_line, shell, opt_io, opt_cmd);
 	cresize(win.w, win.h);
@@ -1937,6 +1942,17 @@ main(int argc, char *argv[])
 run:
 	if (argc > 0) /* eat all remaining arguments */
 		opt_cmd = argv;
+
+	/* Default to login shell so .profile/.zprofile are sourced */
+	static char *logincmd[3];
+	if (!opt_cmd && !opt_line) {
+		const char *sh = getenv("SHELL");
+		if (!sh) sh = shell;
+		logincmd[0] = (char *)sh;
+		logincmd[1] = "-l";
+		logincmd[2] = NULL;
+		opt_cmd = logincmd;
+	}
 
 	if (!opt_title)
 		opt_title = (opt_line || !opt_cmd) ? "mt" : opt_cmd[0];

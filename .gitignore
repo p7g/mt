@@ -1,4 +1,6 @@
 config.h
 *.o
 mt
+mt.app
 .ccls-cache
+mt.icns

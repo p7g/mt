@@ -1,34 +1,42 @@
-st - simple terminal
---------------------
-st is a simple terminal emulator for X which sucks less.
+mt - macOS terminal
+-------------------
+mt is a port of st (simple terminal) to macOS, using native Cocoa, Core Text,
+and Carbon frameworks instead of X11.
 
 
 Requirements
 ------------
-In order to build st you need the Xlib header files.
+macOS with Xcode Command Line Tools installed.
 
 
 Installation
 ------------
-Edit config.mk to match your local setup (st is installed into
-the /usr/local namespace by default).
+Edit config.mk to match your local setup (mt is installed into the /usr/local
+namespace by default).
 
-Afterwards enter the following command to build and install st (if
-necessary as root):
+Afterwards enter the following command to build and install mt (if necessary as
+root):
 
     make clean install
 
 
-Running st
+Configuration
+-------------
+mt is configured by editing config.h and recompiling. A default config.h is
+created from config.def.h on first build.
+
+
+Running mt
 ----------
-If you did not install st with make clean install, you must compile
-the st terminfo entry with the following command:
+If you did not install mt with make clean install, you must compile the st
+terminfo entry with the following command:
 
     tic -sx st.info
 
 See the man page for additional details.
 
+
 Credits
 -------
-Based on Aurélien APTEL <aurelien dot aptel at gmail dot com> bt source code.
-
+Based on st by Aurélien APTEL <aurelien dot aptel at gmail dot com> and the
+suckless.org community.

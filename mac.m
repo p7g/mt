@@ -1789,6 +1789,7 @@ mouseaction(int btn, uint state, int release)
 	win.mode |= MODE_FOCUSED;
 	if (IS_SET(MODE_FOCUS))
 		ttywrite("\033[I", 3, 0);
+	draw();
 }
 
 - (void)windowDidResignKey:(NSNotification *)notification
@@ -1796,6 +1797,7 @@ mouseaction(int btn, uint state, int release)
 	win.mode &= ~MODE_FOCUSED;
 	if (IS_SET(MODE_FOCUS))
 		ttywrite("\033[O", 3, 0);
+	draw();
 }
 
 - (void)windowWillClose:(NSNotification *)notification

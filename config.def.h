@@ -181,14 +181,14 @@ static MouseShortcut mshortcuts[] = {
 #define TERMMOD (MK_CONTROL|MK_SHIFT)
 
 static Shortcut shortcuts[] = {
-	/* mask                 keysym             function        argument */
-	{ MK_COMMAND,           kVK_ANSI_C,        clipcopy,       {.i =  0} },
-	{ MK_COMMAND,           kVK_ANSI_V,        clippaste,      {.i =  0} },
-	{ TERMMOD,              kVK_PageUp,         zoom,           {.f = +1} },
-	{ TERMMOD,              kVK_PageDown,       zoom,           {.f = -1} },
-	{ TERMMOD,              kVK_Home,           zoomreset,      {.f =  0} },
-	{ TERMMOD,              kVK_ANSI_Y,         selpaste,       {.i =  0} },
-	{ MK_SHIFT,             kVK_Help,           selpaste,       {.i =  0} },
+	/* mask                 keysym                function      argument */
+	{ MK_COMMAND,           kVK_ANSI_C,           clipcopy,     {.i =  0} },
+	{ MK_COMMAND,           kVK_ANSI_V,           clippaste,    {.i =  0} },
+	{ MK_COMMAND,           kVK_ANSI_Equal,       zoom,         {.f = +1} },
+	{ MK_COMMAND,           kVK_ANSI_Minus,       zoom,         {.f = -1} },
+	{ MK_COMMAND,           kVK_ANSI_0,           zoomreset,    {.f =  0} },
+	{ TERMMOD,              kVK_ANSI_Y,           selpaste,     {.i =  0} },
+	{ MK_SHIFT,             kVK_Help,             selpaste,     {.i =  0} },
 	{ TERMMOD,              kVK_ANSI_KeypadClear, numlock,      {.i =  0} },
 };
 

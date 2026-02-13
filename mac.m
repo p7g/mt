@@ -1094,6 +1094,7 @@ xsetcursor(int cursor)
 	if (!BETWEEN(cursor, 0, 7)) /* 7: st extension */
 		return 1;
 	win.cursor = cursor;
+	schedule_draw();
 	return 0;
 }
 
